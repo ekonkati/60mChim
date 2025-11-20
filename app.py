@@ -1,396 +1,251 @@
-
-# app.py — Biaxial Footing Designer (Streamlit Skeleton, Patched)
-# ---------------------------------------------------------------
-# Tabs: Inputs → Bearing/Contact → Stability → Shear → Flexure → Pedestal → Anchors → Detailing → Output
-# Units (default): kN, m, MPa (N/mm^2). Convert carefully inside calc functions.
-
-import math
-from dataclasses import dataclass
-from typing import Tuple, Dict, Any
-
-import numpy as np
-import pandas as pd
 import streamlit as st
+import pandas as pd
+import numpy as np
+import json
+import io
 
-# -----------------------------
-# Helpers & Data Structures
-# -----------------------------
+# --- CONFIGURATION & SETUP ---
+st.set_page_config(page_title="Chimney Shell Design", layout="wide")
 
-@dataclass
-class Materials:
-    fck: float     # MPa
-    fy: float      # MPa
-    gamma_c: float # kN/m^3
-    mu_base: float # friction coefficient at base
+def init_session_state():
+    if 'project_data' not in st.session_state:
+        st.session_state.project_data = None
+    if 'generated' not in st.session_state:
+        st.session_state.generated = False
 
-@dataclass
-class Geometry:
-    B: float  # footing width (m, local X)
-    L: float  # footing length (m, local Y)
-    D: float  # footing thickness (m)
-    cover_bot: float  # m
-    cover_top: float  # m
+init_session_state()
 
-@dataclass
-class Pedestal:
-    bp: float  # m
-    lp: float  # m
-    hp: float  # m
+# --- HELPER FUNCTIONS ---
 
-@dataclass
-class Loads:
-    N_serv: float  # kN (service)
-    Mx_serv: float # kN·m (service)
-    My_serv: float # kN·m (service)
-    Hx_serv: float # kN (service)
-    Hy_serv: float # kN (service)
+def get_sigma_cbc(grade_str):
+    # Approximation of IS:456 Permissible Compressive Stress
+    # User can override in advanced settings if needed
+    mapping = {'M20': 7, 'M25': 8.5, 'M30': 10, 'M35': 11.5, 'M40': 13}
+    return mapping.get(grade_str, 10)
 
-    N_uls: float   # kN (ULS)
-    Mx_uls: float  # kN·m (ULS)
-    My_uls: float  # kN·m (ULS)
-    Hx_uls: float  # kN (ULS)
-    Hy_uls: float  # kN (ULS)
+def calculate_frustum_volume(h, r1_out, r1_in, r2_out, r2_in):
+    """
+    Calculates volume of a hollow frustum (tapered cylinder).
+    Level 1 (Top), Level 2 (Bottom)
+    """
+    # Volume of Outer Cone Frustum
+    vol_out = (np.pi * h / 3) * (r1_out**2 + r1_out * r2_out + r2_out**2)
+    # Volume of Inner Cone Frustum
+    vol_in = (np.pi * h / 3) * (r1_in**2 + r1_in * r2_in + r2_in**2)
+    return vol_out - vol_in
 
-@dataclass
-class Soil:
-    qall_sls: float      # kPa (kN/m^2) allowable service bearing
-    gamma_soil: float    # kN/m^3
-    water_table_at_base: bool
+# --- MAIN APP LOGIC ---
 
-BAR_DIAMETERS = [12, 16, 20, 25, 28, 32]  # mm
+st.title("🏭 RC Chimney Shell Load Analysis")
+st.markdown("---")
 
-# -----------------------------
-# Core Calculations
-# -----------------------------
+# ==========================================
+# 1. SIDEBAR - INPUTS
+# ==========================================
+with st.sidebar:
+    st.header("1. Global Geometry")
+    
+    # File Operations
+    st.subheader("File Operations")
+    uploaded_file = st.file_uploader("Open Project (JSON)", type=['json'])
+    
+    st.divider()
+    
+    total_height = st.number_input("Total Height (m)", value=30.0, step=1.0)
+    segment_height = st.number_input("Segment Height (m)", value=2.5, step=0.5)
+    top_inner_dia = st.number_input("Top Inner Dia (m)", value=1.35)
+    
+    # Slope handling (1 in X)
+    slope_type = st.radio("Slope Type", ["Vertical (Cylindrical)", "Tapered"])
+    slope_val = 0.0
+    if slope_type == "Tapered":
+        slope_ratio = st.number_input("Slope (1 in X)", value=50.0)
+        if slope_ratio > 0:
+            slope_val = 1 / slope_ratio
+            
+    default_thickness = st.number_input("Default Shell Thickness (m)", value=0.20)
+    
+    st.header("2. Materials")
+    conc_grade = st.selectbox("Concrete Grade", ["M20", "M25", "M30", "M35", "M40"], index=2)
+    conc_density = st.number_input("Conc. Density (t/m3)", value=2.5)
+    
+    st.header("3. Actions")
+    if st.button("Generate/Reset Grid", type="primary"):
+        # Generate geometric levels
+        levels = []
+        current_h = total_height
+        
+        while current_h >= -0.1: # Go slightly below 0 to catch the raft level
+            # Calculate ID at this height
+            # Depth from top
+            depth = total_height - current_h
+            # Increase in radius = depth * slope
+            radius_increase = depth * slope_val
+            
+            curr_id = top_inner_dia + (2 * radius_increase)
+            curr_od = curr_id + (2 * default_thickness)
+            
+            levels.append({
+                "Level (m)": round(current_h, 3),
+                "Outer Dia (m)": round(curr_od, 4),
+                "Inner Dia (m)": round(curr_id, 4),
+                "Thickness (m)": default_thickness,
+                "Density (t/m3)": conc_density,
+                "Platform Load (t)": 0.0,
+                "Liner Load (t)": 0.0,
+                "Corbel Load (t)": 0.0
+            })
+            
+            # Logic to handle the last segment (raft)
+            if current_h == 0:
+                break
+            next_h = current_h - segment_height
+            if next_h < 0:
+                next_h = 0
+            current_h = next_h
+            
+        st.session_state.project_data = pd.DataFrame(levels)
+        st.session_state.generated = True
 
-def ecc(N: float, Mx: float, My: float) -> Tuple[float, float]:
-    """Return eccentricities ex, ey (m). Handle N≈0 safely."""
-    if abs(N) < 1e-6:
-        return float('inf'), float('inf')
-    return Mx / N, My / N
+# ==========================================
+# LOAD LOGIC (File Open)
+# ==========================================
+if uploaded_file is not None and st.session_state.project_data is None:
+    try:
+        data = json.load(uploaded_file)
+        st.session_state.project_data = pd.DataFrame(data['grid'])
+        st.session_state.generated = True
+        st.success("Project Loaded Successfully!")
+    except Exception as e:
+        st.error(f"Error loading file: {e}")
 
-def full_contact_pressures(N: float, Mx: float, My: float, B: float, L: float) -> Dict[str, Any]:
-    """Full-contact biaxial linear pressure distribution. Returns qmax, qmin (kPa), ex, ey, within_kern."""
-    ex, ey = ecc(N, Mx, My)
-    within_kern = (abs(ex) <= B/6.0) and (abs(ey) <= L/6.0)
-    q0 = N / (B*L)  # kN/m^2
-    qmax = q0 * (1 + 6*abs(ex)/B + 6*abs(ey)/L)
-    qmin = q0 * (1 - 6*abs(ex)/B - 6*abs(ey)/L)
-    return {"ex": ex, "ey": ey, "within_kern": within_kern, "qmax": qmax, "qmin": qmin}
+# ==========================================
+# 2. MAIN INTERFACE - TABS
+# ==========================================
 
-def partial_contact_effective_dims(N: float, Mx: float, My: float, B: float, L: float) -> Dict[str, Any]:
-    """Conservative partial-contact approach: reduced dimensions Bc, Lc; qmax ≈ 4N/(Bc*Lc)."""
-    ex, ey = ecc(N, Mx, My)
-    Bc = B - 6.0*abs(ex)
-    Lc = L - 6.0*abs(ey)
-    feasible = (Bc > 0) and (Lc > 0)
-    qmax = 4.0 * N / max(1e-6, (Bc * Lc))  # kN/m^2
-    qavg = N / max(1e-6, (Bc * Lc))
-    return {"ex": ex, "ey": ey, "Bc": Bc, "Lc": Lc, "feasible": feasible, "qmax": qmax, "qavg": qavg}
+if st.session_state.generated:
+    
+    df = st.session_state.project_data
+    
+    tab1, tab2, tab3 = st.tabs(["📝 Edit Grid & Loads", "🧮 Calculation Results", "💾 Save / Export"])
+    
+    # --- TAB 1: EDIT GRID ---
+    with tab1:
+        st.info("Instructions: Edit the grid below for specific segment overrides (e.g., Stainless Steel top section density, or specific Platform Loads). Calculations update automatically in the next tab.")
+        
+        # Using Data Editor to allow user to tweak the generated geometry
+        edited_df = st.data_editor(
+            df,
+            num_rows="dynamic",
+            height=600,
+            use_container_width=True
+        )
+        
+        # Update session state with edits
+        st.session_state.project_data = edited_df
 
-def base_weight(geom: Geometry, mat: Materials) -> float:
-    """Self-weight of footing block (kN), ignoring pedestal for now (added separately)."""
-    return geom.B * geom.L * geom.D * mat.gamma_c
+    # --- TAB 2: CALCULATIONS ---
+    with tab2:
+        # PERFORM CALCULATIONS ON EDITED_DF
+        calc_df = edited_df.copy()
+        
+        # 1. Material Properties
+        fck = int(conc_grade[1:])
+        sigma_cbc = get_sigma_cbc(conc_grade)
+        m_ratio = 280 / (3 * sigma_cbc)
+        E_static = 5700 * np.sqrt(fck) # N/mm2 = MN/m2
+        # Convert Es to t/m2 (approx 1 N/mm2 = 101.97 t/m2)
+        E_static_tm2 = E_static * 101.97
+        
+        st.markdown(f"**Material Constants:** `Fck`: {fck} | `m`: {round(m_ratio, 2)} | `Es`: {E_static_tm2:,.2f} t/m2")
+        
+        # 2. Section Properties (Area, Inertia)
+        calc_df['Area (m2)'] = (np.pi / 4) * (calc_df['Outer Dia (m)']**2 - calc_df['Inner Dia (m)']**2)
+        calc_df['Inertia (m4)'] = (np.pi / 64) * (calc_df['Outer Dia (m)']**4 - calc_df['Inner Dia (m)']**4)
+        
+        # 3. Dead Load Calculation (Self Weight)
+        # We need to look ahead to the next row to form a segment
+        # Shift the dataframe to get "Next Level" properties
+        calc_df['Next Level'] = calc_df['Level (m)'].shift(-1)
+        calc_df['Next OD'] = calc_df['Outer Dia (m)'].shift(-1)
+        calc_df['Next ID'] = calc_df['Inner Dia (m)'].shift(-1)
+        
+        weights = []
+        for index, row in calc_df.iterrows():
+            if pd.isna(row['Next Level']):
+                weights.append(0.0) # Bottom-most level (Raft) has no weight below it
+            else:
+                h = row['Level (m)'] - row['Next Level']
+                r1_out = row['Outer Dia (m)'] / 2
+                r1_in = row['Inner Dia (m)'] / 2
+                r2_out = row['Next OD'] / 2
+                r2_in = row['Next ID'] / 2
+                
+                # Use average density of this segment
+                vol = calculate_frustum_volume(h, r1_out, r1_in, r2_out, r2_in)
+                wt = vol * row['Density (t/m3)']
+                weights.append(wt)
+        
+        calc_df['Shell Weight (t)'] = weights
+        
+        # 4. Total Load per Level
+        calc_df['Total Weight Segment (t)'] = (
+            calc_df['Shell Weight (t)'] + 
+            calc_df['Platform Load (t)'] + 
+            calc_df['Liner Load (t)'] + 
+            calc_df['Corbel Load (t)']
+        )
+        
+        # 5. Cumulative Load (Top Down)
+        # Since row 0 is top, we use cumsum
+        calc_df['Cumulative Load (t)'] = calc_df['Total Weight Segment (t)'].cumsum()
+        
+        # Clean up display
+        display_cols = [
+            'Level (m)', 'Outer Dia (m)', 'Inner Dia (m)', 'Thickness (m)', 
+            'Area (m2)', 'Inertia (m4)', 
+            'Shell Weight (t)', 'Platform Load (t)', 'Liner Load (t)', 
+            'Cumulative Load (t)'
+        ]
+        
+        st.dataframe(calc_df[display_cols].style.format("{:.3f}"), height=600)
+        
+        # Visualization
+        st.subheader("Load Distribution Profile")
+        st.line_chart(calc_df, x='Level (m)', y='Cumulative Load (t)')
 
-def stability_checks_service(loads: Loads, geom: Geometry, soil: Soil, mat: Materials) -> Dict[str, Any]:
-    """Simple sliding/uplift snapshot at service. Overturning by bearing kernel test already."""
-    Wf = base_weight(geom, mat)
-    Hres = (loads.Hx_serv**2 + loads.Hy_serv**2) ** 0.5
-    N_base = loads.N_serv + Wf
-    R_cap = mat.mu_base * max(0.0, N_base)
-    return {"Wf": Wf, "Hres": Hres, "N_base": N_base, "R_cap": R_cap,
-            "sliding_ok": Hres <= R_cap, "uplift_ok": (loads.N_serv + Wf) > 0.0}
-
-def eff_depth(geom: Geometry, bar_d_mm: float) -> float:
-    """Effective depth d (m) using bottom cover and half bar dia (simple)."""
-    d = geom.D - (geom.cover_bot + (bar_d_mm/1000.0)/2.0)
-    return max(0.0, d)
-
-def one_way_shear_ULS(q_design: float, span_m: float, d: float, strip_width: float=1.0) -> float:
-    """Very simplified one-way shear demand Vu on a strip of unit width."""
-    return q_design * span_m * strip_width  # kN
-
-def punching_perimeter(bp: float, lp: float, d: float) -> float:
-    """Critical punching perimeter b0 at distance d from pedestal loaded area (m)."""
-    return 2.0 * ((bp + 2*d) + (lp + 2*d))
-
-def design_flexure_As(Mu_kNm: float, d_m: float, fy_MPa: float, fck_MPa: float) -> float:
-    """Quick As (mm^2/m) approximation; enforce simple min steel placeholder."""
-    if d_m <= 0:
-        return 0.0
-    Mu_Nmm = Mu_kNm * 1e6
-    z_mm = 0.9 * d_m * 1000.0
-    As_mm2_per_m = Mu_Nmm / max(1e-6, (0.87 * fy_MPa * z_mm))
-    d_mm = d_m * 1000.0
-    As_min = 0.0012 * (1000.0 * d_mm)
-    return max(As_mm2_per_m, As_min)
-
-def bar_schedule_from_As(As_req_mm2_per_m: float, preferred_dia_mm_list=BAR_DIAMETERS, max_spacing_mm=250) -> Dict[str, Any]:
-    """Suggest bar dia and spacing for a target As per meter."""
-    best = None
-    for dia in preferred_dia_mm_list:
-        area = math.pi * (dia**2) / 4.0
-        spacing_mm = min(max_spacing_mm, (area * 1000.0) / max(1e-6, As_req_mm2_per_m))
-        spacing_mm = max(75.0, round(spacing_mm / 10.0) * 10.0)
-        As_prov = area * (1000.0 / spacing_mm)
-        ok = As_prov >= As_req_mm2_per_m
-        candidate = {"dia_mm": dia, "spacing_mm": spacing_mm, "As_prov_mm2_per_m": As_prov, "meets": ok}
-        if ok and (best is None or As_prov < best["As_prov_mm2_per_m"]):
-            best = candidate
-    if best is None:
-        dia = preferred_dia_mm_list[-1]
-        area = math.pi * (dia**2) / 4.0
-        spacing_mm = 75.0
-        As_prov = area * (1000.0 / spacing_mm)
-        best = {"dia_mm": dia, "spacing_mm": spacing_mm, "As_prov_mm2_per_m": As_prov, "meets": As_prov >= As_req_mm2_per_m}
-    return best
-
-# -----------------------------
-# Streamlit UI
-# -----------------------------
-
-st.set_page_config(page_title="Biaxial Footing Designer (Skeleton)", layout="wide")
-
-st.title("🧱 Biaxial Footing Designer — Streamlit Skeleton (Patched)")
-st.caption("Tabs: Inputs → Bearing/Contact → Stability → Shear → Flexure → Pedestal → Anchors → Detailing → Output")
-
-tabs = st.tabs([
-    "Inputs", "Bearing/Contact", "Stability", "Shear", "Flexure", "Pedestal", "Anchors", "Detailing", "Output"
-])
-
-# ---------- Inputs Tab ----------
-with tabs[0]:
-    st.subheader("1) Inputs")
-
-    st.markdown("**Units**: kN, m, MPa (N/mm²).")
-    col1, col2, col3 = st.columns(3)
-
-    with col1:
-        st.markdown("**Geometry**")
-        B = st.number_input("Footing width B (m, local X)", min_value=0.1, value=2.0, step=0.1)
-        L = st.number_input("Footing length L (m, local Y)", min_value=0.1, value=2.5, step=0.1)
-        D = st.number_input("Footing thickness D (m)", min_value=0.2, value=0.6, step=0.05)
-        cover_bot = st.number_input("Bottom cover (m)", min_value=0.03, value=0.06, step=0.01)
-        cover_top = st.number_input("Top cover (m)", min_value=0.03, value=0.05, step=0.01)
-
-    with col2:
-        st.markdown("**Materials & Soil**")
-        fck = st.selectbox("Concrete grade fck (MPa)", [20, 25, 30, 35, 40, 50], index=2)
-        fy = st.selectbox("Steel grade fy (MPa)", [415, 500], index=1)
-        gamma_c = st.number_input("Concrete unit weight γc (kN/m³)", min_value=20.0, value=25.0, step=0.5)
-        mu_base = st.number_input("Base friction coeff μ", min_value=0.2, value=0.5, step=0.05)
-        qall_sls = st.number_input("Allowable bearing q_allow (kPa = kN/m²)", min_value=50.0, value=200.0, step=10.0)
-        gamma_soil = st.number_input("Soil unit weight γsoil (kN/m³)", min_value=16.0, value=18.0, step=0.5)
-        wtb = st.checkbox("Water table at base level", value=False)
-
-    with col3:
-        st.markdown("**Loads**")
-        N_serv = st.number_input("N (service) kN (compression +)", value=1500.0, step=10.0)
-        Mx_serv = st.number_input("Mx (service) kN·m", value=100.0, step=5.0)
-        My_serv = st.number_input("My (service) kN·m", value=80.0, step=5.0)
-        Hx_serv = st.number_input("Hx (service) kN", value=0.0, step=1.0)
-        Hy_serv = st.number_input("Hy (service) kN", value=0.0, step=1.0)
+    # --- TAB 3: SAVE/EXPORT ---
+    with tab3:
+        st.header("Download Project")
+        
+        # Prepare JSON
+        project_export = {
+            "meta": {
+                "height": total_height,
+                "grade": conc_grade
+            },
+            "grid": edited_df.to_dict(orient='records')
+        }
+        
+        json_str = json.dumps(project_export, indent=4)
+        
+        st.download_button(
+            label="💾 Download Project File (.json)",
+            data=json_str,
+            file_name="chimney_project.json",
+            mime="application/json"
+        )
+        
         st.divider()
-        N_uls = st.number_input("N (ULS) kN", value=1800.0, step=10.0)
-        Mx_uls = st.number_input("Mx (ULS) kN·m", value=130.0, step=5.0)
-        My_uls = st.number_input("My (ULS) kN·m", value=110.0, step=5.0)
-        Hx_uls = st.number_input("Hx (ULS) kN", value=0.0, step=1.0)
-        Hy_uls = st.number_input("Hy (ULS) kN", value=0.0, step=1.0)
+        
+        # Export Results to CSV
+        csv = calc_df.to_csv(index=False)
+        st.download_button(
+            label="📊 Export Calculation Table to Excel/CSV",
+            data=csv,
+            file_name="chimney_calculations.csv",
+            mime="text/csv"
+        )
 
-    st.markdown("**Pedestal (for punching & bearing)**")
-    colp1, colp2, colp3 = st.columns(3)
-    with colp1:
-        bp = st.number_input("Pedestal bp (m) along B", min_value=0.2, value=0.6, step=0.05)
-    with colp2:
-        lp = st.number_input("Pedestal lp (m) along L", min_value=0.2, value=0.6, step=0.05)
-    with colp3:
-        hp = st.number_input("Pedestal height hp (m)", min_value=0.2, value=0.6, step=0.05)
-
-    st.session_state["geom"] = Geometry(B, L, D, cover_bot, cover_top)
-    st.session_state["mat"] = Materials(fck, fy, gamma_c, mu_base)
-    st.session_state["soil"] = Soil(qall_sls, gamma_soil, wtb)
-    st.session_state["loads"] = Loads(N_serv, Mx_serv, My_serv, Hx_serv, Hy_serv, N_uls, Mx_uls, My_uls, Hx_uls, Hy_uls)
-    st.session_state["ped"] = Pedestal(bp, lp, hp)
-
-    st.info("➡ Proceed to **Bearing/Contact** tab to evaluate full vs partial contact pressures.")
-
-# ---------- Bearing/Contact Tab ----------
-with tabs[1]:
-    st.subheader("2) Bearing / Contact (Service)")
-    geom: Geometry = st.session_state["geom"]
-    soil: Soil = st.session_state["soil"]
-    loads: Loads = st.session_state["loads"]
-
-    res = full_contact_pressures(loads.N_serv, loads.Mx_serv, loads.My_serv, geom.B, geom.L)
-    st.write(f"Eccentricities: e_x = **{res['ex']:.3f} m**, e_y = **{res['ey']:.3f} m**")
-    st.write(f"Kern check: within kern? **{res['within_kern']}**")
-    st.write(f"Full-contact pressures: q_max = **{res['qmax']:.1f} kPa**, q_min = **{res['qmin']:.1f} kPa**")
-    ok_full = (res["within_kern"] and (res["qmax"] <= soil.qall_sls) and (res["qmin"] >= 0.0))
-    if ok_full:
-        st.success("Full contact OK against allowable bearing.")
-    else:
-        st.warning("Full contact NOT OK → consider partial contact / resizing.")
-
-    with st.expander("Partial Contact (no-tension) — Conservative"):
-        par = partial_contact_effective_dims(loads.N_serv, loads.Mx_serv, loads.My_serv, geom.B, geom.L)
-        st.write(f"Effective dims: Bc = **{par['Bc']:.3f} m**, Lc = **{par['Lc']:.3f} m**, feasible: **{par['feasible']}**")
-        st.write(f"Conservative q_max ≈ **{par['qmax']:.1f} kPa**, q_avg ≈ **{par['qavg']:.1f} kPa**")
-        if par["feasible"] and (par["qmax"] <= soil.qall_sls):
-            st.success("Partial contact OK against allowable bearing.")
-        else:
-            st.error("Partial contact NOT OK → increase plan size or improve ground.")
-
-# ---------- Stability Tab ----------
-with tabs[2]:
-    st.subheader("3) Stability (Service)")
-    geom: Geometry = st.session_state["geom"]
-    soil: Soil = st.session_state["soil"]
-    mat: Materials = st.session_state["mat"]
-    loads: Loads = st.session_state["loads"]
-
-    stab = stability_checks_service(loads, geom, soil, mat)
-    c1, c2, c3, c4 = st.columns(4)
-    c1.metric("Self-weight Wf (kN)", f"{stab['Wf']:.1f}")
-    c2.metric("Horiz. resultants H (kN)", f"{stab['Hres']:.1f}")
-    c3.metric("Friction cap μ·N_base (kN)", f"{stab['R_cap']:.1f}")
-    c4.metric("N_base (kN)", f"{stab['N_base']:.1f}")
-
-    st.write("Sliding OK?" , stab["sliding_ok"])
-    st.write("Uplift OK?" , stab["uplift_ok"])
-    st.info("Refinements: include soil overburden, passive resistance, shear key if adopted; document assumptions.")
-
-# ---------- Shear Tab ----------
-with tabs[3]:
-    st.subheader("4) Shear (ULS) — Skeleton")
-    geom: Geometry = st.session_state["geom"]
-    ped: Pedestal = st.session_state["ped"]
-    mat: Materials = st.session_state["mat"]
-    loads: Loads = st.session_state["loads"]
-
-    q_uls = loads.N_uls / (geom.B * geom.L)  # kPa
-    st.write(f"Assumed ULS soil pressure (placeholder): **{q_uls:.1f} kPa**")
-
-    bar_d = st.selectbox("Trial main bar dia (mm) for d calc", BAR_DIAMETERS, index=2)
-    d_m = eff_depth(geom, bar_d)
-
-    st.write(f"Effective depth d ≈ **{d_m:.3f} m** (with {bar_d} mm bars)")
-
-    cant_B = (geom.B - ped.bp) / 2.0
-    cant_L = (geom.L - ped.lp) / 2.0
-    Vu_x = one_way_shear_ULS(q_uls, cant_L, d_m)
-    Vu_y = one_way_shear_ULS(q_uls, cant_B, d_m)
-
-    c1, c2 = st.columns(2)
-    c1.metric("One-way shear Vu_x (kN/m strip)", f"{Vu_x:.1f}")
-    c2.metric("One-way shear Vu_y (kN/m strip)", f"{Vu_y:.1f}")
-
-    b0 = punching_perimeter(ped.bp, ped.lp, d_m)
-    st.write(f"Punching critical perimeter b0 ≈ **{b0:.3f} m**")
-    st.info("👉 Finalize τ_v vs τ_c checks per IS 456 (punching & beam shear).")
-
-# ---------- Flexure Tab ----------
-with tabs[4]:
-    st.subheader("5) Flexure (ULS) — Skeleton & Auto Bar-Schedule")
-    geom: Geometry = st.session_state["geom"]
-    ped: Pedestal = st.session_state["ped"]
-    mat: Materials = st.session_state["mat"]
-    loads: Loads = st.session_state["loads"]
-
-    q_uls = loads.N_uls / (geom.B * geom.L)  # kPa
-    cant_B = (geom.B - ped.bp) / 2.0
-    cant_L = (geom.L - ped.lp) / 2.0
-
-    Mu_x = q_uls * (cant_L**2) / 2.0  # kN·m/m
-    Mu_y = q_uls * (cant_B**2) / 2.0  # kN·m/m
-
-    bar_d = st.selectbox("Design bar dia (mm)", BAR_DIAMETERS, index=2, key="flex_bar_d")
-    d_m = eff_depth(geom, bar_d)
-
-    As_x = design_flexure_As(Mu_x, d_m, mat.fy, mat.fck)  # mm²/m
-    As_y = design_flexure_As(Mu_y, d_m, mat.fy, mat.fck)  # mm²/m
-
-    st.write(f"Design moments (placeholder): Mu_x = **{Mu_x:.2f} kN·m/m**, Mu_y = **{Mu_y:.2f} kN·m/m**")
-    c1, c2 = st.columns(2)
-    c1.metric("As_req (X-bottom) mm²/m", f"{As_x:.0f}")
-    c2.metric("As_req (Y-bottom) mm²/m", f"{As_y:.0f}")
-
-    sched_x = bar_schedule_from_As(As_x)
-    sched_y = bar_schedule_from_As(As_y)
-
-    st.markdown("**Auto bar-schedule suggestions (bottom):**")
-    c3, c4 = st.columns(2)
-    with c3:
-        st.write(f"X-direction: {sched_x['dia_mm']} mm @ {sched_x['spacing_mm']} mm  (As_prov ≈ {sched_x['As_prov_mm2_per_m']:.0f} mm²/m)")
-    with c4:
-        st.write(f"Y-direction: {sched_y['dia_mm']} mm @ {sched_y['spacing_mm']} mm  (As_prov ≈ {sched_y['As_prov_mm2_per_m']:.0f} mm²/m)")
-
-    st.info("Add top mats where uplift/negative moments under pedestal or anchor forces occur. Replace placeholders with full IS 456 flexural design.")
-
-# ---------- Pedestal Tab ----------
-with tabs[5]:
-    st.subheader("6) Pedestal — Bearing & Ties (Skeleton)")
-    st.write("**Concrete bearing under pedestal on footing (IS 456 enhancement):**")
-    st.latex(r"\sigma_{c,allow} \le 0.45 f_{ck} \sqrt{A_1/A_2}")
-    st.write("Define A1 (loaded area) and A2 (supporting area within permitted dispersion). Provide vertical bars and ties as needed.")
-
-# ---------- Anchors Tab (Patched) ----------
-with tabs[6]:
-    st.subheader("7) Anchors — Layout & Checks (Skeleton)")
-    st.markdown("If anchors are required (uplift/overturning), compute bolt-group tensions from N and Mx, My.")
-    st.code(
-        '''
-# Example: tension in bolts of a rectangular group about centroid
-# (Only bolts in tension considered)
-T_i = N_t/n_t + (Mx*y_i)/sum(y**2) + (My*x_i)/sum(x**2)
-
-# Then check (per ACI 318-19 Chapter 17 or project spec):
-# - Steel tension/yield
-# - Concrete breakout (tension), pull-out, side-face blowout
-# - Shear breakout / pry-out and steel shear
-# - Edge distances, spacing, embedment
-# Provide hairpins/ties around anchor group to control splitting.
-        ''',
-        language="python"
-    )
-    st.info("Provide base plate geometry, grout thickness, and minimum edge cover in concrete.")
-
-# ---------- Detailing Tab ----------
-with tabs[7]:
-    st.subheader("8) Detailing — Mesh & Notes (Skeleton)")
-    st.write("**Bottom mesh:** from Flexure tab (X & Y may differ).")
-    st.write("**Top mesh:** provide under pedestal / uplift zones; ensure code minimums and spacing limits.")
-    st.write("**Cover & laps:** respect clear cover and Ld per IS 456; stagger laps away from peak moments.")
-    st.write("**Shear reinforcement:** if adopted for one-way shear or punching (stud rails/links).")
-
-# ---------- Output Tab ----------
-with tabs[8]:
-    st.subheader("9) Output — Summary (Skeleton)")
-    geom: Geometry = st.session_state["geom"]
-    ped: Pedestal = st.session_state["ped"]
-    mat: Materials = st.session_state["mat"]
-    soil: Soil = st.session_state["soil"]
-    loads: Loads = st.session_state["loads"]
-
-    res = full_contact_pressures(loads.N_serv, loads.Mx_serv, loads.My_serv, geom.B, geom.L)
-    par = partial_contact_effective_dims(loads.N_serv, loads.Mx_serv, loads.My_serv, geom.B, geom.L)
-
-    df = pd.DataFrame({
-        "Item": ["B (m)", "L (m)", "D (m)",
-                 "Ped bp (m)", "Ped lp (m)", "Ped hp (m)",
-                 "fck (MPa)", "fy (MPa)",
-                 "q_allow (kPa)",
-                 "e_x (m)", "e_y (m)",
-                 "Full contact?", "qmax_full (kPa)", "qmin_full (kPa)",
-                 "Bc (m)", "Lc (m)", "qmax_partial (kPa)"
-                ],
-        "Value": [geom.B, geom.L, geom.D,
-                  ped.bp, ped.lp, ped.hp,
-                  mat.fck, mat.fy,
-                  soil.qall_sls,
-                  res["ex"], res["ey"],
-                  res["within_kern"], res["qmax"], res["qmin"],
-                  par["Bc"], par["Lc"], par["qmax"]
-                 ]
-    })
-    st.dataframe(df, use_container_width=True)
-    st.success("Patched version: removed any accidental execution/doc rendering in code blocks.")
+else:
+    st.info("👈 Please enter parameters in the Sidebar and click 'Generate/Reset Grid' to start.")
