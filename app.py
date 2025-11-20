@@ -32,7 +32,6 @@ def generate_sheet_1(params):
     
     for i, lvl in enumerate(levels):
         # Geometry Logic
-        # Your file: "Inner dia = 1.35 + 2x/10^9" -> Effectively constant for this specific file
         inner_dia = params['top_inner_dia'] 
         outer_dia = inner_dia + (2 * params['thickness'])
         
@@ -42,8 +41,6 @@ def generate_sheet_1(params):
         z_mod = inertia / (outer_dia / 2)
         
         # Height of Segment Calculation
-        # Height is distance to the level BELOW. 
-        # Exception: Top level (30.3) -> Height 0 in your file
         height_segment = 0.0
         if i < len(levels) - 1:
             height_segment = lvl - levels[i+1]
@@ -60,6 +57,7 @@ def generate_sheet_1(params):
             'Segment_H': height_segment,
             'Outer_Dia': outer_dia,
             'Inner_Dia': inner_dia,
+            'Thickness': params['thickness'],  # <--- FIXED: Added this missing key
             'Area': area,
             'Inertia': inertia,
             'Z_Modulus': z_mod,
@@ -137,7 +135,11 @@ def calculate_sheet_3(df, zone_factor, I=1.5, R=3.0, Sa_g=2.5):
     df['Wi_hi2'] = df['Total_Node_Wt'] * (df['Height_h']**2)
     sum_Wi_hi2 = df['Wi_hi2'].sum()
     
-    df['Seismic_Force'] = Base_Shear * (df['Wi_hi2'] / sum_Wi_hi2)
+    # Avoid division by zero if sum is 0
+    if sum_Wi_hi2 == 0:
+        df['Seismic_Force'] = 0
+    else:
+        df['Seismic_Force'] = Base_Shear * (df['Wi_hi2'] / sum_Wi_hi2)
     
     # 4. Shear & Moment
     df['Seismic_Shear'] = df['Seismic_Force'].cumsum() # Approx top-down for simplified check
@@ -239,7 +241,8 @@ with tab1:
         column_config={
             "Shell_Wt": st.column_config.NumberColumn(disabled=True, format="%.3f"),
             "Outer_Dia": st.column_config.NumberColumn(format="%.3f"),
-            "Level": st.column_config.NumberColumn(format="%.3f")
+            "Level": st.column_config.NumberColumn(format="%.3f"),
+            "Thickness": st.column_config.NumberColumn(format="%.3f")
         }
     )
     
